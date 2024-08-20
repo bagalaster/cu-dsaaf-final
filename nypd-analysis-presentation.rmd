@@ -130,6 +130,12 @@ nyc_election_results <-
 
 ...but quickly fell to pre-pandemic levels.
 
+<div class="notes">
+Is that the end of the story? Crime went up during the pandemic, but now it's down and everything is great?
+
+Not quite...
+</div>
+
 ```{r ts-model, echo=FALSE, message=FALSE, warning=FALSE}
 shootings_monthly_df <- 
     shooting_clean_df %>% 
@@ -170,6 +176,11 @@ shootings_monthly_df %>%
 
 
 ## Crime is a local phenomenon
+
+<div class="notes">
+If we take a look at where shootings spiked the most during the pandemic, we can see that it's actually concentrated
+in a few areas, and there were even areas where shootings went down.
+</div>
 
 ```{r neighborhood-map, echo=FALSE, message=FALSE, warning=FALSE}
 sf_use_s2(FALSE)
@@ -265,10 +276,19 @@ shooting_diff_by_neighborhood %>%
         fillColor = ~get('colorBin')(shooting_palette, domain)(diff), 
         fillOpacity = 0.5,
         label = ~map(make_neighborhood_label(votes_dem, votes_rep, pct_dem_lead, ntaname), HTML)
-    )
+    ) %>% 
+    addLegend(position = "bottomright", pal = colorBin(shooting_palette, domain), values = domain)
 ```
 
 ## Crime is an *extremely* local phenomenon
+
+<div class="notes">
+In fact if you look at voting precincts (the smallest administrative boundaries I could find),
+you can see that the shootings in some cases spiked in only very specific blocks of the city.
+
+This means that not everyone experienced the same spike in shootings in their local area, and likely, not everyone is going
+to agree on how much violent crime they perceive to have occurred.
+</div>
 
 ```{r precinct-shooting-map, echo=FALSE, message=FALSE, warning=FALSE}
 precinct_shooting_map_data <- 
@@ -296,9 +316,30 @@ precinct_shooting_map_data %>%
 
 # What do voters think?
 
+<div class="notes">
+To tie it back to what originally got me thinking about this post-pandemic shooting spike, do these differences
+in how shootings are distributed translate to voting tendencies?
+
+Maybe someone living in an area where shootings spiked more tended to be more receptive to messaging that paints
+a bleaker picture of their city.
+
+I decided to cross reference this data with precinct-level voting results from the 2020 presidential election 
+published by the New York Times to see if there were any patterns. This isn't the best proxy for political views by
+any means, but crime is a strong enough theme in national politics that I would think the presidential election would
+be a useful barometer for voter preferences on crime.
+</div>
+
 ## Were shooting rates correlated with voter preferences?
 
 Different geographical grains tell different stories...
+
+<div class="notes">
+Turns out that the data doesn't really give us a clear picture. 
+
+If you break things out by neighborhood, it looks like people who live in areas where shootings spiked
+more aggressively were more likely to vote for the Democrat candidate for President in 2020.
+
+</div>
 
 ```{r neighborhood-plot, echo=FALSE, message=FALSE, warning=FALSE}
 neighborhood_linear_model <- 
@@ -330,6 +371,15 @@ shooting_diff_by_neighborhood %>%
 ## Were shooting rates correlated with voter preferences?
 
 Different geographical grains tell different stories...
+
+<div class="notes">
+If you look by precinct, there is basically no effect.
+
+There could be a bunch of reasons for this
+- Race/class as a confounding variable
+- Maybe crime wasn't so important to New Yorkers in the election
+- Maybe non-violent crime is a factor, we don't account for that here
+</div>
 
 ```{r precinct-shooting-plot, echo=FALSE, message=FALSE, warning=FALSE}
 
@@ -365,6 +415,12 @@ shootings_diff_by_precinct %>%
 > - Shooting rates did spike during the pandemic in NYC and returned to pre-pandemic levels on aggregate
 > - Shooting rate changes during the pandemic varied wildly within NYC, even from block to block
 > - Difficult to say if or how violent crime rates influenced voter preferences in 2020
+
+<div class="notes">
+Overall, my takeaway from this analysis is that the national conversation around crime, particularly in cities, has a
+tendency to obscure a lot of the details on what is driving crime and what options exist to reduce it. I think it's worth
+keeping that in mind next time we see or hear sweeping claims about "crime levels"
+</div>
 
 # Thanks!
 
