@@ -1,0 +1,492 @@
+---
+title: "How are New Yorkers' Politics Influenced by Post-Pandemic 'Levels of Crime' in the City?"
+output: 
+    html_document:
+        toc: true
+        toc-depth: 2
+---
+
+```{r header, message=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(modeltime)
+library(sf)
+library(leaflet)
+
+NYPD_SHOOTING_URL <- "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD"
+```
+
+## Importing Data
+
+Below, we import the shooting dataset.
+
+```{r data-import, message=FALSE, warning=FALSE}
+shooting_raw_df <- 
+    NYPD_SHOOTING_URL %>% 
+    read_csv(
+        col_types = cols(
+            INCIDENT_KEY            = col_integer(),
+            OCCUR_DATE              = col_date(format = "%m/%d/%Y"),
+            OCCUR_TIME              = col_time(format = "%H:%M:%S"),
+            PRECINCT                = col_integer(),
+            JURISDICTION_CODE       = col_integer(),
+            STATISTICAL_MURDER_FLAG = col_logical(),
+            X_COORD_CD              = col_double(),
+            Y_COORD_CD              = col_double(),
+            Latitude                = col_double(),
+            Longitude               = col_double(),
+            .default                = col_character()
+        )
+    ) %>% 
+    janitor::clean_names()
+```
+
+## Data Cleaning
+
+We start with a summary of the dataset:
+
+```{r data-cleaning-summary}
+shooting_raw_df %>% 
+    summary()
+
+shooting_raw_df %>% 
+    glimpse()
+```
+
+A few items we will need to address in cleaning:
+
+-   We should replace `occur_date` and `occur_time` with a single `occur_datetime` value for ease of analysis
+-   There are a bunch of character columns here which would benefit from casting to factor, as these all have a small number of possible values
+    -   `boro`
+    -   `*_age_group`
+    -   `*_sex`
+    -   `*_race`
+-   The factor columns have multiple "missing data" representations in many cases. For example, `*_age_group` has both `"UNKNOWN"` and `NA_character_` values present. We should collapse these. See plots below.
+-   `*_age_group` also contains
+-   There are 59 missing values for lat/lon. There are also many missing values in the free-form text description fields. We will ignore these if and when they appear in our analysis.
+
+```{r data-cleaning-missing-data}
+shooting_raw_df %>% 
+    select(boro, ends_with("_age_group"), ends_with("_sex"), ends_with("_race")) %>% 
+    pivot_longer(everything(), names_to = "variable", values_to = "value") %>% 
+    ggplot(aes(x = value)) +
+    geom_bar() +
+    facet_wrap(facets = vars(variable), nrow = 2, scales = "free_x") +
+    xlab(NULL) +
+    ylab(NULL) +
+    theme(axis.text.x.bottom = element_text(angle = 45, hjust = 1, size = 6))
+```
+
+```{r data-cleaning-transformation, message=FALSE, warning=FALSE}
+shooting_clean_df <- 
+    shooting_raw_df %>% 
+    mutate(
+        occur_datetime = lubridate::make_datetime(
+            year = year(occur_date),
+            month = month(occur_date),
+            day = day(occur_date),
+            hour = hour(occur_time),
+            min = minute(occur_time),
+            sec = second(occur_time),
+            tz = "America/New_York"
+        ),
+        boro = 
+            boro %>% 
+            as_factor(),
+        across(
+            ends_with("_age_group"),
+            ~ coalesce(., "UNKNOWN") %>% 
+                as_factor() %>% 
+                fct_collapse(UNKNOWN = c("UNKNOWN", "(null)")) %>% 
+                fct_relevel("<18", "18-24", "25-44", "45-64", "65+")
+        ),
+        across(
+            c(ends_with("_sex"), ends_with("_race")),
+            ~ coalesce(., "U") %>%
+                as_factor() %>% 
+                fct_collapse(U = c("U", "(null)"))
+        )
+    )
+```
+
+## Background
+
+Crime, especially in large cities like New York, has been a hot topic in American political discourse lately. 
+In New York's case, it's common to see news coverage (particularly from media outlets 
+broadly considered conservative) citing a widespread malaise among New York residents about the levels 
+of violent crime in the city. 
+
+- https://www.foxnews.com/us/crisis-new-york-39-year-nypd-vet-says-palpable-fear-still-plagues-city-crime-remains-high
+- https://nypost.com/2024/05/23/us-news/nyc-tourism-still-lags-pre-covid-era-amid-crime-concerns-report/
+- https://www.foxnews.com/us/nyc-less-safe-pandemic-fear-violent-crime
+
+Meanwhile, other coverage (usually from media outlets broadly considered liberal) cite declining levels of
+violent crime since the pandemic.
+
+- https://abc7ny.com/nypd-crime-shootings-murders/14259597/
+- https://www.nbcnews.com/news/us-news/violent-crime-us-cities-still-pre-pandemic-levels-report-says-rcna95176
+- https://www.nytimes.com/2024/05/26/us/politics/crime-biden-trump.html
+The differing narratives here are so different that you could be forgiven for not knowing which direction levels
+of violent crime are going after having read all these articles. Additionally, violent crime is a
+[highly localized phenomenon](https://www.huduser.gov/portal/periodicals/em/summer16/highlight2.html), meaning
+aggregate statistics and broad claims about violent crime levels are likely to obscure more nuanced realities.
+
+With all of this in mind, in order to better understand trends in violent crime NYC, particularly during and 
+after the 2020 COVID pandemic, I aim to analyze the rates of shootings in the provided dataset over time,
+with particular attention paid to the time period from 2017 to the present. Additionally, I aim to 
+identify any differences in crime rates by geography and look for correlations with voting patterns from the 
+2020 presidential election, which may give a more detailed picture of how violent crime is evolving and
+suggest how different communities may be perceiving this crime.
+
+## Analysis
+
+### Shootings Over Time
+
+Below, we show a time series of the number of shootings per month.
+
+The data appear highly seasonal within the year, so we also show the trend component of an STL decomposition
+as the "seasonally adjusted" number of shootings. 
+
+
+```{r ts-model, message=FALSE}
+shootings_monthly_df <- 
+    shooting_clean_df %>% 
+    mutate(occur_month = lubridate::floor_date(occur_datetime, unit = "month")) %>% 
+    group_by(occur_month) %>% 
+    summarize(num_incidents = n())
+
+stl_model_spec <- 
+    seasonal_reg(mode = "regression", seasonal_period_1 = "1 year") %>% 
+    set_engine("stlm_arima")
+
+stl_model_fit <- 
+    stl_model_spec %>% 
+    fit(num_incidents ~ occur_month, data = shootings_monthly_df)
+
+
+shootings_monthly_df %>% 
+    mutate(trend = stl_model_fit$fit$models$model_1$stl[,"Trend"] %>% as.numeric()) %>% 
+    pivot_longer(cols = c(num_incidents, trend), names_to = "variable", values_to = "value") %>% 
+    ggplot(aes(x = occur_month)) +
+    geom_line(aes(y = value, color = variable)) +
+    geom_hline(yintercept = 0, color = "white", size = 1.5) +
+    scale_x_datetime(breaks = breaks_width(width = "2 year"), labels = label_date(format = "%Y")) +
+    scale_color_manual(
+        name = NULL, 
+        values = c("num_incidents" = "black", "trend" = "red"),
+        labels = c("num_incidents" = "Observed", "trend" = "Seasonally Adj."),
+    ) +
+    labs(
+        title = "Monthly Shooting Incidents in NYC",
+        subtitle = "Shootings near 15-year low following a sharp rise during COVID"
+    ) +
+    xlab(NULL) +
+    ylab("No. of Incidents") +
+    theme(legend.position = "bottom")
+
+
+seasonal_df <- 
+    shootings_monthly_df %>% 
+    mutate(
+        seasonal = stl_model_fit$fit$models$model_1$stl[,"Seasonal12"] %>% as.numeric(),
+        month = month(occur_month) %>% as.integer(),
+        month_label = month(occur_month, label = TRUE),
+        occur_year = year(occur_month)
+    )
+
+
+seasonal_df %>% 
+    ggplot(aes(x = occur_year, y = seasonal)) +
+    geom_hline(yintercept = 0, color = "white", size = 1.5) +
+    geom_line(aes(color = month, group = month)) +
+    geom_point(aes(color = month)) +
+    ggrepel::geom_text_repel(
+        aes(x = occur_year, y = seasonal, label = month_label, color = month), 
+        data = filter(seasonal_df, occur_year == max(occur_year)),
+        nudge_x = 1,
+        segment.color = NA
+    ) +
+    scale_x_continuous(breaks = breaks_width(2)) +
+    scale_y_continuous(breaks = breaks_width(20)) +
+    scale_color_viridis_c() +
+    xlab("Year") +
+    ylab("Seasonal Component") +
+    labs(
+        title = "Seasonal Component, Monthly Shootings",
+        subtitle = "Shootings peak in the summer months",
+    ) +
+    theme(legend.position = "none")
+```
+
+What's clear from these visualizations is that shooting incidents came down steadily from 2006 to 2020, spiked
+during the COVID pandemic, and have fallen more or less to pre-pandemic levels since. 
+
+### Correlation with Geography and Politics
+
+The Upshot at the New York Times has compiled 
+[extremely detailed election results](https://github.com/TheUpshot/presidential-precinct-map-2020) for the 
+2020 presidential election, which includes precinct-level data for the five boroughs of New York City. Using 
+this data, we can correlate voting patterns and shooting incidents within smaller geographies in the city. See
+the GitHub link above for more information. For the purposes of this analysis, the relevant fields in the data
+are
+
+- `votes_dem`: the number of votes for the Democratic candidate (Joe Biden)
+- `votes_rep`: the number of votes for the Republican candidate (Donald Trump)
+- `votes_total`: the total number of votes cast for president in the precinct
+- `pct_dem_lead`: the margin by which the Democratic candidate led the Republican candidate in that precinct
+(calculated as `(votes_dem - votes_rep) / votes_total`)
+
+
+```{r election-results, message=FALSE, warning=FALSE}
+nyc_borough_fips_codes <- c(
+    "36061",  # Manhattan
+    "36005",  # The Bronx
+    "36047",  # Brooklyn
+    "36081",  # Queens
+    "36085"   # Staten Island
+)
+
+nyc_election_results <- 
+    ## Downloaded from 
+    ## https://int.nyt.com/newsgraphics/elections/map-data/2020/national/precincts-with-results.geojson.gz
+    here::here("data/election-results.geojson") %>% 
+    geojsonsf::geojson_sf() %>% 
+    janitor::clean_names() %>% 
+    mutate(fips_code = str_split_i(geoid, "-", 1)) %>% 
+    filter(fips_code %in% nyc_borough_fips_codes)
+```
+
+#### By Precinct
+
+Below, we plot the difference in incidents per year for the periods 2020-2021 (the pandemic) and 2016-2019
+(pre-pandemic) by voting precinct. There appears to be very little correlation between presidential election 
+results at the precinct level and changes in the rate of shooting incidents.
+
+A simple linear model of this difference as a function of `pct_dem_lead` shows a statistically significant
+but infinitesimal positive correlation.
+
+
+```{r precinct-shooting-plot, message=FALSE, warning=FALSE}
+sf_use_s2(FALSE)
+
+shooting_sf <- 
+    shooting_clean_df %>% 
+    mutate(location_geo = purrr::map2(longitude, latitude, ~ st_point(x = c(.x, .y)))) %>% 
+    st_as_sf() %>% 
+    st_set_crs(4326)
+
+shooting_precinct <- 
+    nyc_election_results %>%
+    st_join(
+        shooting_sf,
+        join = st_intersects
+    ) %>% 
+    as_tibble() %>% 
+    select(incident_key, geoid, occur_datetime)
+
+shootings_2016_2019_by_precinct <- 
+    shooting_precinct %>% 
+    filter(year(occur_datetime) %in% 2016:2019) %>% 
+    group_by(geoid) %>% 
+    summarize(n_incidents_2016_2019 = sum(!is.na(incident_key)))
+    
+shootings_2020_2021_by_precinct <- 
+    shooting_precinct %>% 
+    filter(year(occur_datetime) %in% 2020:2021) %>% 
+    group_by(geoid) %>% 
+    summarize(n_incidents_2020_2021 = sum(!is.na(incident_key)))
+
+shootings_diff_by_precinct <- 
+    nyc_election_results %>% 
+    as_tibble() %>% 
+    left_join(shootings_2016_2019_by_precinct, by = "geoid") %>% 
+    left_join(shootings_2020_2021_by_precinct, by = "geoid") %>% 
+    mutate(
+        across(starts_with("n_incidents"), ~ coalesce(., 0)),
+        diff = n_incidents_2020_2021 / 2 - n_incidents_2016_2019 / 4
+    ) 
+
+linear_model <- 
+    linear_reg() %>% 
+    fit(diff ~ pct_dem_lead, data = shootings_diff_by_precinct)
+
+linear_model %>% 
+    broom::tidy()
+
+shootings_diff_by_precinct %>% 
+    mutate(model_pred = predict(linear_model, new_data = shootings_diff_by_precinct)$.pred) %>% 
+    ggplot(aes(pct_dem_lead)) +
+    geom_hex(aes(y = diff)) +
+    geom_hline(yintercept = 0, size = 1, color = "white") +
+    geom_vline(xintercept = 0, size = 1, color = "white") +
+    geom_line(aes(y = model_pred), color = "red", size = 0.5) +
+    scale_fill_viridis_c(name = "# precincts") +
+    labs(
+        title = "Change in Shootings/Yr from 2016-19 to 2020-21 vs. Dem. Margin by Precinct",
+        subtitle = "Virtually no correlation exists",
+        x = "Dem. Margin",
+        y = "Shootings/Yr"
+    ) +
+    theme(
+        legend.position = "bottom", 
+        legend.key.height = unit(2, "mm"), 
+        legend.key.width = unit(2, "cm"),
+        legend.title.position = "bottom"
+    )
+```
+
+If we look at a map of the data, it's clear that changes in rates of shootings are highly localized.
+There are only a handful of precincts where shooting rates shot way up during the pandemic, and even
+a few precincts where shooting rates went way down, with most precincts staying at roughly the same
+rates.
+
+```{r precinct-shooting-map, message=FALSE, warning=FALSE}
+make_shooting_label <- function(diff) {
+    str_glue("<br>Change in Shootings per Year: {round(diff, 2)}</br>")
+}
+
+precinct_shooting_map_data <- 
+    shootings_diff_by_precinct %>% 
+    left_join(nyc_election_results %>% select(geoid, geometry), by = "geoid") %>% 
+    mutate(diff = coalesce(diff, 0)) 
+
+domain <- c(min(precinct_shooting_map_data$diff), max(precinct_shooting_map_data$diff))
+lower_palette <- colorRampPalette(c("blue", "#eeeeff"), space = "Lab")(abs(domain[1]))
+upper_palette <- colorRampPalette(c("#ffefef", "orange"), space = "Lab")(domain[2])
+shooting_palette <- c(lower_palette, upper_palette)
+
+precinct_shooting_map_data %>% 
+    st_as_sf() %>% 
+    leaflet(options = leafletOptions(minZoom = 10)) %>% 
+    addTiles() %>% 
+    addPolygons(
+        weight = 1, 
+        color = ~get('colorBin')(shooting_palette, domain)(diff), 
+        fillOpacity = 0.5,
+        label = ~map(make_shooting_label(diff), htmltools::HTML)
+    ) %>% 
+    addLegend(position = "bottomright", pal = colorBin(shooting_palette, domain), values = domain)
+```
+
+#### By Neighborhood
+
+If we examine on the neighborhood level, we can see a much stronger correlation. Neighborhood names and boundaries
+used here are the ones provided by 
+[NYC OpenData](https://data.cityofnewyork.us/City-Government/Neighborhood-Names-GIS/99bc-9p23). Areas in northern
+Manhattan, the Bronx, and Eastern Brooklyn seemed to experience the largest increases 
+in shootings during the pandemic, whereas many areas of Staten Island and Queens saw decreases in
+shootings.
+
+```{r neighborhood-plot, message=FALSE, warning=FALSE}
+neighborhoods <- 
+    # Downloaded from https://data.cityofnewyork.us/City-Government/Neighborhood-Names-GIS/99bc-9p23
+    here::here("data/neighborhood-boundaries.geojson") %>% 
+    geojsonsf::geojson_sf() %>% 
+    janitor::clean_names()
+
+shooting_diff_by_neighborhood <- 
+    neighborhoods %>% 
+    st_join(shootings_diff_by_precinct %>% st_as_sf(), join = st_intersects) %>% 
+    as_tibble() %>% 
+    select(-votes_per_sqkm) %>% 
+    group_by(ntacode, ntaname, geometry) %>% 
+    summarize(
+        across(c(starts_with("n_incidents"), starts_with("votes_")), sum)
+    ) %>% 
+    ungroup() %>% 
+    mutate(
+        diff = n_incidents_2020_2021 / 2 - n_incidents_2016_2019 / 4,
+        pct_dem_lead = 100 * (votes_dem - votes_rep) / votes_total
+    )
+
+neighborhood_linear_model <- 
+    linear_reg() %>% 
+    fit(diff ~ pct_dem_lead, data = shooting_diff_by_neighborhood)
+
+neighborhood_linear_model %>% 
+    broom::tidy()
+
+shooting_diff_by_neighborhood %>% 
+    mutate(model_pred = predict(neighborhood_linear_model, new_data = shooting_diff_by_neighborhood)$.pred) %>% 
+    ggplot(aes(pct_dem_lead)) +
+    geom_hex(aes(y = diff)) +
+    geom_hline(yintercept = 0, size = 1, color = "white") +
+    geom_vline(xintercept = 0, size = 1, color = "white") +
+    geom_line(aes(y = model_pred), color = "red", size = 0.5) +
+    scale_fill_viridis_c(name = "# neighborhoods") +
+    labs(
+        title = "Change in Shootings/Yr from 2016-19 to 2020-21 vs. Dem. Margin by Neighborhood",
+        subtitle = "Increased Dem Support Correlated with Increased Shootings",
+        x = "Dem. Margin",
+        y = "Shootings/Yr"
+    ) +
+    theme(
+        legend.position = "bottom", 
+        legend.key.height = unit(2, "mm"), 
+        legend.key.width = unit(2, "cm"),
+        legend.title.position = "bottom"
+    )
+```
+
+
+```{r neighborhood-map, message=FALSE, warning=FALSE}
+domain <- c(min(shooting_diff_by_neighborhood$diff), max(shooting_diff_by_neighborhood$diff))
+lower_palette <- colorRampPalette(c("blue", "#eeeeff"), space = "Lab")(abs(domain[1]))
+upper_palette <- colorRampPalette(c("#ffefef", "orange"), space = "Lab")(domain[2])
+shooting_palette <- c(lower_palette, upper_palette)
+
+make_neighborhood_label <- function(votes_dem, votes_rep, pct_dem_lead, name) {
+    margin <- 
+        if_else(
+            pct_dem_lead >= 0, 
+            str_glue("D+{round(pct_dem_lead, 1)}%"), 
+            str_glue("R+{round(-pct_dem_lead, 1)}%")
+        )
+    style <- if_else(
+        pct_dem_lead >= 0,
+        "color:blue;",
+        "color:red;"
+    )
+    str_glue("<h3>{name}</h3><p>Votes for Biden: {votes_dem}</p><p>Votes for Trump: {votes_rep}</p><p><b>Margin: <span style={style}>{margin}<span></b></p>")
+}
+
+shooting_diff_by_neighborhood %>% 
+    sf::st_as_sf() %>% 
+    leaflet() %>% 
+    addTiles() %>% 
+    addPolygons(    
+        weight = 1,
+        color = "black",
+        fillColor = ~get('colorBin')(shooting_palette, domain)(diff), 
+        fillOpacity = 0.5,
+        label = ~map(make_neighborhood_label(votes_dem, votes_rep, pct_dem_lead, ntaname), htmltools::HTML)
+    )
+```
+
+It's particularly interesting to note here how much the results of this analysis can change depending on
+the grain of the geography chosen, which emphasizes just how localized a phenomenon crime really is.
+
+I think what we can say confidently is that discussing "levels of crime" in a geography as large as
+New York City is a fraught exercise. The rates of violence taking place have varied on
+a scale as small as a few blocks. For this reason, it's difficult to say exactly how, if at all, shooting
+rates affected voting patterns in New York.
+
+## Possible Sources of Bias and Areas for Improvment
+
+With crime data, there are plenty of potential sources of bias. These are a couple that come to mind,
+but domain experts will surely be able to identify more:
+
+- Under/over reporting in certain areas due to over/under policing of different areas
+- Inaccurate data entry - presumably these fields are manually entered by investigating officers, who may have
+different standards for how to perform data entry
+
+Additionally, my own personal biases certainly affect the analysis here. Crime is a heavily politicized topic of
+study, and my decision to analyze crime in New York through the lens of politics was definitely motivated by
+my personal views My perception of crime in New York is also colored by my personal experiences there - I lived in
+Hell's Kitchen for a year and a half from 2021-2022. In order to mitigate these sources of bias, it was 
+important to avoid jumping to conclusions and only draw inferences evidenced in the data.
+
+Finally, analyzing only violent crime leaves some holes in this analysis. It's not clear how non-violent crimes,
+like theft, have evolved over this time period and may also contribute to political
+perceptions of crime in New York. 
+

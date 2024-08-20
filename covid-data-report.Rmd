@@ -8,6 +8,7 @@ date: "`r Sys.Date()`"
 
 ```{r message=FALSE, warning=FALSE}
 library(tidyverse)
+library(scales)
 
 CASES_URL <- "https://github.com/CSSEGISandData/COVID-19/raw/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_confirmed_global.csv"
 
@@ -160,8 +161,8 @@ cases_deaths_recovered %>%
     geom_line(aes(y = susceptible, color = "susceptible")) +
     geom_line(aes(y = infected, color = "infected")) +
     geom_line(aes(y = removed, color = "removed")) +
-    scale_x_date(breaks = scales::breaks_width("2 months"), labels = scales::label_date()) +
-    scale_y_log10(label = scales::label_log()) +
+    scale_x_date(breaks = breaks_width("2 months"), labels = label_date()) +
+    scale_y_log10(label = label_log()) +
     scale_color_manual(
         name = NULL,
         values = c("susceptible" = "blue", "infected" = "red", "removed" = "green"),
@@ -280,8 +281,8 @@ sir_tbl %>%
         values = c(actual = "solid", predicted = "dashed"),
         labels = c(actual = "Actual", predicted = "Projected")
     ) +
-    scale_x_date(breaks = scales::breaks_width("2 month"), labels = scales::label_date()) +
-    scale_y_continuous(labels = scales::label_number(scale = 1e-6)) +
+    scale_x_date(breaks = breaks_width("2 month"), labels = label_date()) +
+    scale_y_continuous(labels = label_number(scale = 1e-6)) +
     labs(
         title = "Infected and Removed Populations",
         subtitle = "Infected population spikes prematurely in projections"
@@ -310,8 +311,8 @@ sir_tbl %>%
         values = c(actual = "solid", predicted = "dashed"),
         labels = c(actual = "Actual", predicted = "Projected")
     ) +
-    scale_x_date(breaks = scales::breaks_width("2 month"), labels = scales::label_date()) +
-    scale_y_continuous(labels = scales::label_number(scale = 1e-6)) +
+    scale_x_date(breaks = breaks_width("2 month"), labels = label_date()) +
+    scale_y_continuous(labels = label_number(scale = 1e-6)) +
     labs(
         title = "New Cases of Covid, Projected and Actual", 
         subtitle = "SIR predicts a huge spike that doesn't happen"

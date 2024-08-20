@@ -15,9 +15,14 @@ what the outlook really is
 
 ```{r header, message=FALSE, echo=FALSE}
 library(tidyverse)
+library(janitor)
 library(tidymodels)
 library(modeltime)
 library(sf)
+library(geojsonsf)
+library(here)
+library(janitor)
+library(htmltools)
 library(leaflet)
 
 NYPD_SHOOTING_URL <- "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD"
@@ -41,14 +46,14 @@ shooting_raw_df <-
             .default                = col_character()
         )
     ) %>% 
-    janitor::clean_names()
+    clean_names()
 ```
 
 ```{r data-cleaning-transformation, echo=FALSE, message=FALSE, warning=FALSE}
 shooting_clean_df <- 
     shooting_raw_df %>% 
     mutate(
-        occur_datetime = lubridate::make_datetime(
+        occur_datetime = make_datetime(
             year = year(occur_date),
             month = month(occur_date),
             day = day(occur_date),
@@ -88,9 +93,9 @@ nyc_borough_fips_codes <- c(
 nyc_election_results <- 
     ## Downloaded from 
     ## https://int.nyt.com/newsgraphics/elections/map-data/2020/national/precincts-with-results.geojson.gz
-    here::here("data/election-results.geojson") %>% 
-    geojsonsf::geojson_sf() %>% 
-    janitor::clean_names() %>% 
+    here("data/election-results.geojson") %>% 
+    geojson_sf() %>% 
+    clean_names() %>% 
     mutate(fips_code = str_split_i(geoid, "-", 1)) %>% 
     filter(fips_code %in% nyc_borough_fips_codes)
 ```
@@ -128,7 +133,7 @@ nyc_election_results <-
 ```{r ts-model, echo=FALSE, message=FALSE, warning=FALSE}
 shootings_monthly_df <- 
     shooting_clean_df %>% 
-    mutate(occur_month = lubridate::floor_date(occur_datetime, unit = "month")) %>% 
+    mutate(occur_month = floor_date(occur_datetime, unit = "month")) %>% 
     group_by(occur_month) %>% 
     summarize(num_incidents = n())
 
@@ -171,7 +176,7 @@ sf_use_s2(FALSE)
 
 shooting_sf <- 
     shooting_clean_df %>% 
-    mutate(location_geo = purrr::map2(longitude, latitude, ~ st_point(x = c(.x, .y)))) %>% 
+    mutate(location_geo = map2(longitude, latitude, ~ st_point(x = c(.x, .y)))) %>% 
     st_as_sf() %>% 
     st_set_crs(4326)
 
@@ -211,9 +216,9 @@ shootings_diff_by_precinct <-
 
 neighborhoods <- 
     # Downloaded from https://data.cityofnewyork.us/City-Government/Neighborhood-Names-GIS/99bc-9p23
-    here::here("data/neighborhood-boundaries.geojson") %>% 
-    geojsonsf::geojson_sf() %>% 
-    janitor::clean_names()
+    here("data/neighborhood-boundaries.geojson") %>% 
+    geojson_sf() %>% 
+    clean_names()
 
 shooting_diff_by_neighborhood <- 
     neighborhoods %>% 
@@ -251,7 +256,7 @@ make_neighborhood_label <- function(votes_dem, votes_rep, pct_dem_lead, name) {
 }
 
 shooting_diff_by_neighborhood %>% 
-    sf::st_as_sf() %>% 
+    st_as_sf() %>% 
     leaflet() %>% 
     addTiles() %>% 
     addPolygons(    
@@ -259,7 +264,7 @@ shooting_diff_by_neighborhood %>%
         color = "black",
         fillColor = ~get('colorBin')(shooting_palette, domain)(diff), 
         fillOpacity = 0.5,
-        label = ~map(make_neighborhood_label(votes_dem, votes_rep, pct_dem_lead, ntaname), htmltools::HTML)
+        label = ~map(make_neighborhood_label(votes_dem, votes_rep, pct_dem_lead, ntaname), HTML)
     )
 ```
 
@@ -284,7 +289,7 @@ precinct_shooting_map_data %>%
         weight = 1, 
         color = ~get('colorBin')(shooting_palette, domain)(diff), 
         fillOpacity = 0.5,
-        label = ~map(make_shooting_label(diff), htmltools::HTML)
+        label = ~map(make_shooting_label(diff), HTML)
     ) %>% 
     addLegend(position = "bottomright", pal = colorBin(shooting_palette, domain), values = domain)
 ```
