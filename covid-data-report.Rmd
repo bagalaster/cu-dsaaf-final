@@ -1,0 +1,346 @@
+---
+title: "Modeling COVID Cases with a Simple SIR model"
+output: 
+    html_document:
+        toc: true
+date: "`r Sys.Date()`"
+---
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+
+CASES_URL <- "https://github.com/CSSEGISandData/COVID-19/raw/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_confirmed_global.csv"
+
+DEATHS_URL <- "https://github.com/CSSEGISandData/COVID-19/raw/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_deaths_global.csv"
+
+RECOVERED_URL <- "https://github.com/CSSEGISandData/COVID-19/raw/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_recovered_global.csv"
+```
+
+# Executive Summary
+
+In this analysis, we attempt to model the evolution of the number of cases and deaths due to COVID in the US using
+a rudimentary [SIR model](https://en.wikipedia.org/wiki/Compartmental_models_in_epidemiology#The_SIR_model). In
+particular, we estimate the parameters of the SIR model using data from the early days of the pandemic and solve
+the model forward to generate a forecast of cases and deaths.
+
+We find that a naive implementation of the SIR model 
+predicts a spike in cases during the summer of 2020 that did not
+occur. This is likely due to interventions such as social distancing that slowed the spread of the virus. 
+Additionally, it is known that there is systematic under-reporting of recoveries in 
+the US for the time period studied, which would tend
+to cause over-estimation of recovery time and, therefore, future infected population.
+
+# Data Import
+
+Below, we import and tidy the Johns Hopkins cases/deaths/recovered data and compile it into a single time series.
+The grain of this time series is weekly since most reporting agencies updated their data weekly.
+
+A major quality issue of note is that recoveries are widely considered under-reported in the data, 
+to a point where the 
+maintainers of this dataset [discontinued support](https://github.com/CSSEGISandData/COVID-19/issues/4465)
+for recovery figures in late November. In the absence of better information, we will use the recovery figures 
+as provided, but it will be important to note this issue in the data as we draw inferences later.
+
+
+```{r}
+clean_table <- function(tbl, values_to) {
+    tbl %>% 
+        rename(province_state = `Province/State`, country_region = `Country/Region`, lat = Lat, long = Long) %>% 
+        pivot_longer( 
+            cols = -c(province_state, country_region, lat, long), 
+            names_to = "date",
+            names_transform = mdy,
+            values_to = values_to
+        )
+}
+
+summarize_table <- function(tbl, value) {
+    tbl %>% 
+        filter(country_region == "US", is.na(province_state)) %>% 
+        group_by(week = floor_date(date, unit = "week")) %>% 
+        summarize({{value}} := sum({{value}}, na.rm = TRUE))
+}
+
+
+col_spec <- cols(
+    `Province/State` = col_character(),
+    `Country/Region` = col_character(),
+    .default = col_double()
+)
+
+cases <- 
+    CASES_URL %>% 
+    read_csv(col_types = col_spec) %>% 
+    clean_table(values_to = "cases") %>% 
+    summarize_table(cases)
+
+deaths <- 
+    DEATHS_URL %>% 
+    read_csv(col_types = col_spec) %>% 
+    clean_table(values_to = "deaths") %>% 
+    summarize_table(deaths)
+
+recovered <- 
+    RECOVERED_URL %>% 
+    read_csv(col_types = col_spec) %>% 
+    clean_table(values_to = "recovered") %>% 
+    summarize_table(recovered)
+```
+
+
+# Modeling new cases with SIR
+
+## Background
+
+[SIR](https://en.wikipedia.org/wiki/Compartmental_models_in_epidemiology#The_SIR_model) is a simple compartmental
+epidemiological model in which a fixed population of people are in one of three states:
+
+- *$S$: Susceptible*: People who are uninfected and may become infected via contact with infected individuals
+- *$I$: Infected*: People with the disease who can spread
+- *$R$: Removed*: People who have had the disease and can no longer infect susceptible people, whether by
+successful recovery or by death.
+
+The model is dictated by a set of three differential equations
+\[
+    \frac{dS}{dt} = -\beta SI
+\]
+\[
+    \frac{dI}{dt} = \beta SI - \gamma I
+\]
+\[
+    \frac{dR}{dt} = \gamma I
+\]
+where $\beta$ is a parameter representing the level of infectiousness of the disease and $\gamma$ is a parameter
+controlling the speed of removal from the infectious population. Additionally, the model assumes a static
+population $S_t + I_t + R_t = N$ for fixed $N$.
+
+## Modeling
+
+For our purposes, we will focus on forecasting the number of cases in the time period May - November 2020.
+
+To do this, we will
+
+1. Calculate actual values for $S_t, I_t, R_t$ using the number of new cases, deaths, recoveries, and the
+approximate population of the US in 2020.
+2. Estimate the parameters $\beta$ and $\gamma$ using the data from the time period January - April 2020
+3. Recursively estimate $S_t$, $I_t$, $R_t$ according to the discretized form of the above differential equations
+4. Calculate predicted new cases as $S_t - S_{t-1}$
+
+Below, we perform step 1 and show the values for $S_t, I_t, R_t$ calculated.
+
+```{r}
+cases_deaths_recovered <- 
+    cases %>% 
+    full_join(deaths, by = "week") %>% 
+    full_join(recovered, by = "week") %>% 
+    mutate(
+        across(c("cases", "deaths", "recovered"), ~ coalesce(., 0))
+    ) %>% 
+    filter(week <= ymd("2021-12-01"))
+
+# approximate population of the US around 2020
+# https://www.census.gov/quickfacts/fact/table/US/POP010220
+POPULATION <- 330000000 
+
+add_sir <- function(tbl, starting_population) {
+    tbl %>% 
+        mutate(
+            susceptible = starting_population - cases,
+            infected = cases - deaths - recovered,
+            removed = deaths + recovered
+        )
+}
+
+sir_tbl <- add_sir(cases_deaths_recovered, POPULATION)
+
+cases_deaths_recovered %>% 
+    add_sir(POPULATION) %>% 
+    filter(week <= ymd('2020-12-01')) %>% 
+    ggplot(aes(week)) +
+    geom_line(aes(y = susceptible, color = "susceptible")) +
+    geom_line(aes(y = infected, color = "infected")) +
+    geom_line(aes(y = removed, color = "removed")) +
+    scale_x_date(breaks = scales::breaks_width("2 months"), labels = scales::label_date()) +
+    scale_y_log10(label = scales::label_log()) +
+    scale_color_manual(
+        name = NULL,
+        values = c("susceptible" = "blue", "infected" = "red", "removed" = "green"),
+        labels = c("susceptible" = "Susceptible", "infected" = "Infected", "removed" = "Removed"),
+    ) +
+    labs(
+        title = "Susceptible, Infected, Removed Populations Observed"
+    ) +
+    xlab(NULL) +
+    ylab("Population (millions)") +
+    theme(legend.position = "bottom")
+```
+
+Now, we perform step 2. We implement an extremely crude approach to estimating the parameters $\beta$ and $\gamma$.
+We leverage the differential equations of the SIR model dictating $dS/dt$ and $dR/dt$, giving us
+\[
+    \beta = -\frac{dS/dt}{SI}
+\]
+\[
+    \gamma = \frac{dR/dt}{I}
+\]
+Discretizing, we have
+\[
+    \beta_t = -\frac{S_t - S_{t-1}}{S_{t-1} I_{t - 1}}
+\]
+\[
+    \gamma_t = \frac{R_t - R_{t - 1}}{I_{t - 1}}
+\]
+We assume that $\beta$ and $\gamma$ are fixed, and estimate $\beta$ and $\gamma$ to
+be the median of $\beta_t$ and $\gamma_t$, respectively, over every week $t$ in Jan - Apr 2020.
+We choose a median instead of the canonical mean to minimize the effects of outliers in the data.
+The estimated values are shown below.
+
+```{r}
+train_tbl <- 
+    sir_tbl %>% 
+    filter(week <= ymd('2020-05-01'))
+
+est_parameters <- 
+    train_tbl %>% 
+    mutate(
+        prev_susceptible_times_infected = lag(susceptible * infected), 
+        prev_infected = lag(infected),
+        est_beta = -(susceptible - lag(susceptible)) / prev_susceptible_times_infected,
+        est_gamma = (removed - lag(removed)) / prev_infected
+    ) %>% 
+    summarize(beta = median(est_beta, na.rm = TRUE), gamma = median(est_gamma, na.rm = TRUE))
+
+est_parameters
+```
+
+Now, we perform step 3 and use the discretized version of the SIR model and the estimated values of
+$\beta$ and $\gamma$ to project the size of each compartment forward in time.
+\[
+    S_{t+1} = S_t - \beta S_t I_t
+    \]\[
+    I_{t+1} = I_t + \beta S_t I_t - \gamma I_t
+    \]\[
+    R_{t+1} = R_t + \gamma I_t
+\]
+Below, we show the projected population of infected and recovered people using this method, as well as
+the actual populations. Notice that the SIR model expects a giant spike in infections in the middle of summer
+that does not occur.
+
+```{r warning=FALSE}
+calc_forward <- function(date, s, i, r, beta, gamma, n_periods) {
+    out_s <- rep(NA, n_periods)
+    out_i <- rep(NA, n_periods)
+    out_r <- rep(NA, n_periods)
+    for (t in 1:n_periods) {
+        if (t == 1) {
+            prev_s <- s
+            prev_i <- i
+            prev_r <- r
+        } else {
+            prev_s <- out_s[t - 1]
+            prev_i <- out_i[t - 1]
+            prev_r <- out_r[t - 1]
+        }
+        out_s[t] = prev_s - beta * prev_s * prev_i
+        out_i[t] = prev_i + beta * prev_s * prev_i - gamma * prev_i
+        out_r[t] = prev_r + gamma * prev_i
+    }
+    
+    tibble(
+        week = date + period(week = 1:n_periods),
+        pred_susceptible = out_s,
+        pred_infected = out_i,
+        pred_removed = out_r
+    )
+}
+
+last_state <- 
+    train_tbl %>% 
+    filter(week == max(week)) %>% 
+    select(week, s = susceptible, i = infected, r = removed)
+
+predictions <- 
+    calc_forward(last_state$week, last_state$s, last_state$i, last_state$r, est_parameters$beta, est_parameters$gamma, 33)
+
+sir_tbl %>% 
+    filter(week <= ymd('2020-12-01')) %>% 
+    left_join(predictions, by = "week") %>% 
+    ggplot(aes(week)) +
+    geom_line(aes(y = infected, color = "infected", linetype = "actual")) +
+    geom_line(aes(y = pred_infected, color = "infected", linetype = "predicted")) +
+    geom_line(aes(y = removed, color = "removed", linetype = "actual")) +
+    geom_line(aes(y = pred_removed, color = "removed", linetype = "predicted")) +
+    scale_color_manual(
+        name = NULL,
+        values = c(infected = "red", removed = "black"),
+        labels = c(infected = "Infected", removed = "Removed")
+    ) +
+    scale_linetype_manual(
+        name = NULL,
+        values = c(actual = "solid", predicted = "dashed"),
+        labels = c(actual = "Actual", predicted = "Projected")
+    ) +
+    scale_x_date(breaks = scales::breaks_width("2 month"), labels = scales::label_date()) +
+    scale_y_continuous(labels = scales::label_number(scale = 1e-6)) +
+    labs(
+        title = "Infected and Removed Populations",
+        subtitle = "Infected population spikes prematurely in projections"
+    ) +
+    xlab(NULL) +
+    ylab("Population (millions)") +
+    theme(legend.position = "bottom")
+```
+
+Finally, we perform step 4 and translate these projections into new case projections. Again,
+the SIR model expects a huge spike in new cases during the summer that did not come to pass.
+
+```{r}
+sir_tbl %>% 
+    filter(week <= ymd('2020-12-01')) %>% 
+    left_join(predictions, by = "week") %>% 
+    mutate(
+        actual_new_cases = lag(susceptible) - susceptible, 
+        pred_new_cases = (lag(pred_susceptible) - pred_susceptible) %>% coalesce(actual_new_cases)
+    ) %>% 
+    ggplot(aes(week)) +
+    geom_line(aes(y = actual_new_cases, linetype = "actual")) +
+    geom_line(aes(y = pred_new_cases, linetype = "predicted")) +
+    scale_linetype_manual(
+        name = NULL,
+        values = c(actual = "solid", predicted = "dashed"),
+        labels = c(actual = "Actual", predicted = "Projected")
+    ) +
+    scale_x_date(breaks = scales::breaks_width("2 month"), labels = scales::label_date()) +
+    scale_y_continuous(labels = scales::label_number(scale = 1e-6)) +
+    labs(
+        title = "New Cases of Covid, Projected and Actual", 
+        subtitle = "SIR predicts a huge spike that doesn't happen"
+    ) +
+    xlab(NULL) +
+    ylab("New Cases (millions)") +
+    theme(legend.position = "bottom")
+```
+
+# Discussion/Bias in the Data
+
+Clearly, the SIR model failed spectacularly when it came to predicting the number of new cases in the data.
+There are a couple of possible explanations in my view.
+
+- Our estimation methods for $\beta$ and $\gamma$ assume that these parameters are fixed throughout the pandemic.
+This is of course very unlikely to be true in the data, given that governments around the world quickly
+implemented interventions like social distancing and travel restrictions that slowed the spread of the virus
+down dramatically compared to earlier in the year.
+- Recoveries are thought to be [under-reported](https://covidtracking.com/about-data/faq#why-have-you-stopped-reporting-national-recoveries)
+in the data. The maintainers explain that state-level data on recoveries and active cases are not well
+standardized, and many large states do not even report report recoveries. For this reason, it's likely that
+we are under-estimating the rate at which people are removed from the infected bucket, causing a premature
+spike in the model.
+
+I would propose the following areas for improvement in the modeling techniques employed here:
+
+- Allowing for changes in $\beta$ and $\gamma$ over time would likely have yielded results which are more
+responsive to changes in the spread of the disease that arise from anticipated human interventions
+- In the absence of accurate recovery data, it may be difficult to get a reliable estimate for $\gamma$. More
+sophisticated methods of inferring recovery rates could be used. For example, instead of relying on raw numbers,
+we could infer the number of recoveries from the number of cases and an estimate of how long it takes to recover
+from the disease taken from empirical studies.
